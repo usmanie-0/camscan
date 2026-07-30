@@ -1,0 +1,31 @@
+﻿# Camera vendor name substrings, matched case-insensitively against the
+# IEEE OUI registry. Format: keyword,weight,note
+# high = strong camera signal | medium = camera-capable / smart home
+hikvision,high,IP camera and DVR manufacturer
+dahua,high,IP camera and DVR manufacturer
+xiongmai,high,budget DVR chipset vendor
+hisilicon,high,DVR/IPC chipset
+uniview,high,IP camera manufacturer
+vivotek,high,IP camera manufacturer
+axis communications,high,IP camera manufacturer
+mobotix,high,IP camera manufacturer
+reolink,high,consumer IP camera
+annke,high,consumer IP camera
+swann,high,consumer security cameras
+lorex,high,consumer security cameras
+arlo,high,consumer cloud camera
+wyze,high,consumer cloud camera
+eufy,high,consumer cloud camera
+ring,high,consumer doorbell and camera
+blink,high,consumer cloud camera
+nest,high,consumer cloud camera
+tuya,high,smart home platform used by many cameras
+shenzhen ubia,high,camera ODM
+ezviz,high,Hikvision consumer brand
+foscam,high,consumer IP camera
+amcrest,high,consumer IP camera
+tp-link,medium,makes Tapo cameras and much else
+xiaomi,medium,makes cameras and many other devices
+amazon technologies,medium,Blink and Ring hardware
+google,medium,Nest hardware
+espressif,medium,DIY camera modules ESP32-CAM
