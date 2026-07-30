@@ -1,4 +1,4 @@
-﻿"""Collection pass: sweep, probe, and persist to the store."""
+"""Collection pass: sweep, probe, and persist to the store."""
 
 from camscan import store
 from camscan.lan.iface import detect_active
@@ -39,6 +39,7 @@ def collect(con, skip_ports=False, note=None, progress=None):
 
         if skip_ports:
             h["open_ports"] = []
+            h["ports_skipped"] = True
         else:
             say(f'port scan {i}/{len(hosts)}: {h["ip"]}')
             port_annotate(h)
@@ -75,3 +76,4 @@ if __name__ == "__main__":
 
     print("\ndb:", store.stats(con))
     con.close()
+

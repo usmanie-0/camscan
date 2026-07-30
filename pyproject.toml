@@ -1,0 +1,15 @@
+[project]
+name = "camscan"
+version = "0.2.0"
+description = "Hidden networked camera detection"
+requires-python = ">=3.11"
+
+[project.scripts]
+camscan = "camscan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["camscan*"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

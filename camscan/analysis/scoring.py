@@ -1,4 +1,4 @@
-﻿"""Unified scoring engine. LAN signals now; RF signals arrive in Phase 5."""
+"""Unified scoring engine. LAN signals now; RF signals arrive in Phase 5."""
 
 from camscan import store
 
@@ -112,7 +112,9 @@ def unchecked(host):
     gaps = []
     if not host.get("has_rf"):
         gaps.append("no RF data: cloud-only cameras may serve nothing on the LAN")
-    if host.get("cam_vendor_weight") and not host.get("open_ports"):
+    if host.get("ports_skipped"):
+        gaps.append("port scan skipped: run without --fast for full LAN evidence")
+    elif host.get("cam_vendor_weight") and not host.get("open_ports"):
         gaps.append("camera-vendor device with no open ports: likely cloud-only")
     return gaps
 
@@ -147,4 +149,5 @@ if __name__ == "__main__":
         print()
 
     con.close()
+
 
