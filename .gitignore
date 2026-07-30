@@ -1,0 +1,14 @@
+﻿.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+*.db
+*.sqlite3
+*.log
+.vscode/
+.idea/
