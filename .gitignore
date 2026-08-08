@@ -12,3 +12,9 @@ dependencies.lock
 *.log
 .vscode/
 .idea/
+
+# ESP-IDF firmware build artifacts
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
