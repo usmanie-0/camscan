@@ -1,26 +1,21 @@
-// camscan_fw.c  --  Phase 4, Step 5: two-stage 2.4 GHz channel hop + C lines
+// camscan_fw.c  --  Phase 4, Step 6: dual-band hop (2.4 GHz + 5 GHz)
 //
-// The fixed single channel is gone. The app loop now sweeps the band:
+// Extends Step 5's two-stage hop across both bands. The ESP32-C5 is
+// single-band-at-a-time, so a 5 GHz channel needs band mode 5G_ONLY and a
+// 2.4 GHz channel needs 2G_ONLY -- hop_to() switches band mode only when the
+// band actually changes (the channel list is ordered 2.4 first, then 5 GHz).
 //
-//   STAGE 1 (survey): hop channels 1..13, dwell SURVEY_MS each, emit one C line
-//                     per channel (channel summary). No D lines -- coarse pass.
-//   STAGE 2 (focus):  rank channels by activity, dwell FOCUS_SECS seconds on the
-//                     top FOCUS_TOP_K, emitting detailed D lines (tagged with the
-//                     current channel) plus a C line each 1-second window.
-//   ...then loop back to survey.
+// DFS channels (52-64 here): we are RX-only and never transmit, so passive
+// listening is permitted. The driver may still refuse set_channel on some of
+// them depending on region -- that's handled by the same graceful skip as any
+// other rejected channel (not ESP_ERROR_CHECK'd).
 //
-// The promiscuous callback is UNCHANGED from Step 4 (aggregation + retry dedup).
-// Everything new is in app_main / the hop + emit helpers.
-//
-// Line contracts:
+// Line contracts (band field now "2G" or "5G"):
 //   D,<mac>,<band>,<ch>,<rssi_avg>,<frames>,<bytes_up>,<bytes_down>,<h0..h3>,<retries>
 //   C,<band>,<ch>,<dwell_ms>,<frames>,<bytes>,<stations>,<strongest_rssi>,<max_up_bytes>
-//       strongest_rssi = closest (max) uplink rssi_avg on the channel; 0 = no uplink
-//       max_up_bytes   = largest single station's bytes_up (camera hint)
 //   S,<uptime_ms>,<free_heap>,<frames_dropped>
 //
-// set_channel is NOT wrapped in ESP_ERROR_CHECK: region-blocked channels
-// (e.g. 12/13) are skipped, not fatal.
+// Callback UNCHANGED from Step 4/5 (aggregation + retry dedup).
 
 #include <stdio.h>
 #include <stdint.h>
@@ -40,11 +35,21 @@
 
 // ---- Config ---------------------------------------------------------------
 
-static const uint8_t CH_LIST[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
-#define N_CH        (sizeof(CH_LIST) / sizeof(CH_LIST[0]))
-#define SURVEY_MS   300     // per-channel dwell in the survey pass
-#define FOCUS_SECS  3       // per-channel dwell (in 1 s windows) in the focus pass
-#define FOCUS_TOP_K 3       // how many busiest channels to focus on
+typedef struct { bool is_5g; uint8_t ch; } chan_t;
+
+// 2.4 GHz first (1..13), then 5 GHz (UNII-1, lower DFS block, UNII-3).
+// Ordered so the band mode flips at most once per survey pass.
+static const chan_t CHANS[] = {
+    {false,1},{false,2},{false,3},{false,4},{false,5},{false,6},{false,7},
+    {false,8},{false,9},{false,10},{false,11},{false,12},{false,13},
+    {true,36},{true,40},{true,44},{true,48},           // UNII-1 (non-DFS)
+    {true,52},{true,56},{true,60},{true,64},           // UNII-2A (DFS)
+    {true,149},{true,153},{true,157},{true,161},{true,165}, // UNII-3 (non-DFS)
+};
+#define N_CH        (sizeof(CHANS) / sizeof(CHANS[0]))
+#define SURVEY_MS   300
+#define FOCUS_SECS  3
+#define FOCUS_TOP_K 3
 #define TABLE_SIZE  64
 
 static const char *TAG = "camscan";
@@ -70,9 +75,11 @@ static dev_entry_t * volatile g_active = g_buf[0];
 static portMUX_TYPE        g_swap_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile uint32_t g_frames_dropped = 0;
-static volatile uint32_t g_dups           = 0;   // deduped (kept for future use)
+static volatile uint32_t g_dups           = 0;
 static uint8_t           g_base_mac[6];
-static uint8_t           g_cur_channel = 0;       // channel the loop is parked on
+static uint8_t           g_cur_channel = 0;
+static bool              g_cur_is5g    = false;
+static wifi_band_mode_t  g_cur_band_mode = WIFI_BAND_MODE_2G_ONLY;
 
 static dev_entry_t *table_get(dev_entry_t *t, const uint8_t *mac)
 {
@@ -95,7 +102,7 @@ static dev_entry_t *table_get(dev_entry_t *t, const uint8_t *mac)
     return e;
 }
 
-// ---- Promiscuous RX callback (unchanged from Step 4) ----------------------
+// ---- Promiscuous RX callback (unchanged) ----------------------------------
 
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
@@ -163,28 +170,33 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     e->seq_valid = true;
 }
 
-// ---- Hop + emit helpers (run in the loop task) ----------------------------
+// ---- Hop + emit helpers ---------------------------------------------------
 
-// Retune to `ch` and start it clean. Returns false if the driver rejects the
-// channel (region-blocked) -- caller skips it. Discards any straddling frames
-// by swapping to the already-cleared buffer and memset-ing the one we leave.
-static bool hop_to(uint8_t ch)
+// Retune to (band, ch). Switches band mode only on a band change. Returns
+// false if the driver rejects the band or channel (region/DFS) -> caller skips.
+static bool hop_to(bool is_5g, uint8_t ch)
 {
+    wifi_band_mode_t want = is_5g ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY;
+    if (want != g_cur_band_mode) {
+        if (esp_wifi_set_band_mode(want) != ESP_OK) {
+            return false;
+        }
+        g_cur_band_mode = want;
+    }
     if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
         return false;
     }
     g_cur_channel = ch;
+    g_cur_is5g = is_5g;
 
     taskENTER_CRITICAL(&g_swap_mux);
     dev_entry_t *snap = g_active;
     g_active = (snap == g_buf[0]) ? g_buf[1] : g_buf[0];
     taskEXIT_CRITICAL(&g_swap_mux);
-    memset(snap, 0, sizeof(g_buf[0]));   // discard old-channel tail
+    memset(snap, 0, sizeof(g_buf[0]));
     return true;
 }
 
-// Swap out the current window, emit its C summary (+ D lines if with_d), clear
-// it, and return the channel's frame count (used as the survey activity score).
 static uint32_t emit_window(uint32_t dwell_ms, bool with_d)
 {
     taskENTER_CRITICAL(&g_swap_mux);
@@ -192,8 +204,9 @@ static uint32_t emit_window(uint32_t dwell_ms, bool with_d)
     g_active = (snap == g_buf[0]) ? g_buf[1] : g_buf[0];
     taskEXIT_CRITICAL(&g_swap_mux);
 
+    const char *band = g_cur_is5g ? "5G" : "2G";
     uint32_t tot_frames = 0, tot_bytes = 0, stations = 0, max_up = 0;
-    int strongest = 1;   // sentinel (rssi is always negative; 1 = "none seen")
+    int strongest = 1;
 
     for (int i = 0; i < TABLE_SIZE; i++) {
         if (!snap[i].in_use || snap[i].frames == 0) {
@@ -214,9 +227,9 @@ static uint32_t emit_window(uint32_t dwell_ms, bool with_d)
             }
         }
         if (with_d) {
-            printf("D,%02x:%02x:%02x:%02x:%02x:%02x,2G,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u\n",
+            printf("D,%02x:%02x:%02x:%02x:%02x:%02x,%s,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u\n",
                    e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
-                   (unsigned)g_cur_channel,
+                   band, (unsigned)g_cur_channel,
                    rssi_avg,
                    (unsigned)e->frames,
                    (unsigned)e->bytes_up, (unsigned)e->bytes_down,
@@ -226,8 +239,8 @@ static uint32_t emit_window(uint32_t dwell_ms, bool with_d)
     }
 
     int strongest_out = (strongest == 1) ? 0 : strongest;
-    printf("C,2G,%u,%u,%u,%u,%u,%d,%u\n",
-           (unsigned)g_cur_channel, (unsigned)dwell_ms,
+    printf("C,%s,%u,%u,%u,%u,%u,%d,%u\n",
+           band, (unsigned)g_cur_channel, (unsigned)dwell_ms,
            (unsigned)tot_frames, (unsigned)tot_bytes, (unsigned)stations,
            strongest_out, (unsigned)max_up);
     fflush(stdout);
@@ -245,7 +258,7 @@ static void print_status(void)
     fflush(stdout);
 }
 
-// ---- Wi-Fi bring-up (no fixed channel; the hop loop drives channels) ------
+// ---- Wi-Fi bring-up -------------------------------------------------------
 
 static void wifi_sniffer_start(void)
 {
@@ -257,7 +270,9 @@ static void wifi_sniffer_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Start in 2.4 GHz; hop_to() switches bands as it sweeps.
     ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY));
+    g_cur_band_mode = WIFI_BAND_MODE_2G_ONLY;
 
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
@@ -265,7 +280,7 @@ static void wifi_sniffer_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(promisc_cb));
 
-    ESP_LOGI(TAG, "sniffer up: 2.4 GHz hop (survey %d ch x %dms, focus top-%d x %ds)",
+    ESP_LOGI(TAG, "sniffer up: dual-band hop (%d chans, survey %dms, focus top-%d x %ds)",
              (int)N_CH, SURVEY_MS, FOCUS_TOP_K, FOCUS_SECS);
 }
 
@@ -289,11 +304,11 @@ void app_main(void)
         uint32_t score[N_CH];
         for (int i = 0; i < (int)N_CH; i++) {
             score[i] = 0;
-            if (!hop_to(CH_LIST[i])) {
-                continue;   // region-blocked channel -> skip (no C line)
+            if (!hop_to(CHANS[i].is_5g, CHANS[i].ch)) {
+                continue;   // band/channel refused (region/DFS) -> skip
             }
             vTaskDelay(pdMS_TO_TICKS(SURVEY_MS));
-            score[i] = emit_window(SURVEY_MS, false);   // C line only
+            score[i] = emit_window(SURVEY_MS, false);
         }
         print_status();
 
@@ -311,7 +326,7 @@ void app_main(void)
                 }
             }
             if (best < 0) {
-                break;   // no more active channels
+                break;
             }
             used[best] = true;
             focus_idx[n_focus++] = best;
@@ -319,12 +334,12 @@ void app_main(void)
 
         // ---- STAGE 2: FOCUS ----
         for (int f = 0; f < n_focus; f++) {
-            if (!hop_to(CH_LIST[focus_idx[f]])) {
+            if (!hop_to(CHANS[focus_idx[f]].is_5g, CHANS[focus_idx[f]].ch)) {
                 continue;
             }
             for (int s = 0; s < FOCUS_SECS; s++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                emit_window(1000, true);   // D lines + C line
+                emit_window(1000, true);
             }
             print_status();
         }
