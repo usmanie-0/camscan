@@ -1,21 +1,14 @@
-// camscan_fw.c  --  Phase 4, Step 6: dual-band hop (2.4 GHz + 5 GHz)
+// camscan_fw.c  --  Phase 4, Step 6 + Step 7 camera-candidate highlight
 //
-// Extends Step 5's two-stage hop across both bands. The ESP32-C5 is
-// single-band-at-a-time, so a 5 GHz channel needs band mode 5G_ONLY and a
-// 2.4 GHz channel needs 2G_ONLY -- hop_to() switches band mode only when the
-// band actually changes (the channel list is ordered 2.4 first, then 5 GHz).
+// Same dual-band hop as Step 6. Adds a "CAM?" highlight line: for each focus
+// D line, if the device looks camera-shaped (up-heavy + big frames + strong,
+// close RSSI) it ALSO emits a CAM? line so it stands out from ordinary traffic.
+// This is a test/diagnostic aid for Step 7 ground-truth validation; the normal
+// D/C/S lines are unchanged.
 //
-// DFS channels (52-64 here): we are RX-only and never transmit, so passive
-// listening is permitted. The driver may still refuse set_channel on some of
-// them depending on region -- that's handled by the same graceful skip as any
-// other rejected channel (not ESP_ERROR_CHECK'd).
+//   CAM?,<mac>,<band>,<ch>,<rssi_avg>,<bytes_up>,<bytes_down>,<h2>,<h3>,<frames>
 //
-// Line contracts (band field now "2G" or "5G"):
-//   D,<mac>,<band>,<ch>,<rssi_avg>,<frames>,<bytes_up>,<bytes_down>,<h0..h3>,<retries>
-//   C,<band>,<ch>,<dwell_ms>,<frames>,<bytes>,<stations>,<strongest_rssi>,<max_up_bytes>
-//   S,<uptime_ms>,<free_heap>,<frames_dropped>
-//
-// Callback UNCHANGED from Step 4/5 (aggregation + retry dedup).
+// Tune the three CAM_* thresholds below if it's too eager or too quiet.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -37,20 +30,24 @@
 
 typedef struct { bool is_5g; uint8_t ch; } chan_t;
 
-// 2.4 GHz first (1..13), then 5 GHz (UNII-1, lower DFS block, UNII-3).
-// Ordered so the band mode flips at most once per survey pass.
 static const chan_t CHANS[] = {
     {false,1},{false,2},{false,3},{false,4},{false,5},{false,6},{false,7},
     {false,8},{false,9},{false,10},{false,11},{false,12},{false,13},
-    {true,36},{true,40},{true,44},{true,48},           // UNII-1 (non-DFS)
-    {true,52},{true,56},{true,60},{true,64},           // UNII-2A (DFS)
-    {true,149},{true,153},{true,157},{true,161},{true,165}, // UNII-3 (non-DFS)
+    {true,36},{true,40},{true,44},{true,48},
+    {true,52},{true,56},{true,60},{true,64},
+    {true,149},{true,153},{true,157},{true,161},{true,165},
 };
 #define N_CH        (sizeof(CHANS) / sizeof(CHANS[0]))
 #define SURVEY_MS   300
 #define FOCUS_SECS  3
 #define FOCUS_TOP_K 3
 #define TABLE_SIZE  64
+
+// Camera-candidate highlight thresholds (Step 7). A CAM? line is emitted when
+// a device in a focus window meets ALL of these:
+#define CAM_MIN_UP    5000   // bytes_up in the window (a real uplink stream)
+#define CAM_MIN_RSSI  (-70)  // uplink rssi_avg at least this strong (i.e. close)
+// (frame size is intentionally NOT a gate -- see the CAM? block below)
 
 static const char *TAG = "camscan";
 
@@ -172,8 +169,6 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 
 // ---- Hop + emit helpers ---------------------------------------------------
 
-// Retune to (band, ch). Switches band mode only on a band change. Returns
-// false if the driver rejects the band or channel (region/DFS) -> caller skips.
 static bool hop_to(bool is_5g, uint8_t ch)
 {
     wifi_band_mode_t want = is_5g ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY;
@@ -235,6 +230,20 @@ static uint32_t emit_window(uint32_t dwell_ms, bool with_d)
                    (unsigned)e->bytes_up, (unsigned)e->bytes_down,
                    (unsigned)e->h[0], (unsigned)e->h[1], (unsigned)e->h[2], (unsigned)e->h[3],
                    (unsigned)e->retries);
+
+            // Camera-candidate highlight: the robust signal is up-heavy VOLUME
+            // at close/strong RSSI. Frame size is NOT gated -- a video call
+            // uploads small packets (h0/h1) while an H.264 camera sends big ones,
+            // so h2/h3 are printed for context but not required.
+            if (e->rssi_n > 0 && rssi_avg >= CAM_MIN_RSSI &&
+                e->bytes_up > e->bytes_down &&
+                e->bytes_up >= CAM_MIN_UP) {
+                printf("CAM?,%02x:%02x:%02x:%02x:%02x:%02x,%s,%u,%d,%u,%u,%u,%u,%u\n",
+                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
+                       band, (unsigned)g_cur_channel, rssi_avg,
+                       (unsigned)e->bytes_up, (unsigned)e->bytes_down,
+                       (unsigned)e->h[2], (unsigned)e->h[3], (unsigned)e->frames);
+            }
         }
     }
 
@@ -270,7 +279,6 @@ static void wifi_sniffer_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Start in 2.4 GHz; hop_to() switches bands as it sweeps.
     ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY));
     g_cur_band_mode = WIFI_BAND_MODE_2G_ONLY;
 
@@ -280,7 +288,7 @@ static void wifi_sniffer_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(promisc_cb));
 
-    ESP_LOGI(TAG, "sniffer up: dual-band hop (%d chans, survey %dms, focus top-%d x %ds)",
+    ESP_LOGI(TAG, "sniffer up: dual-band hop (%d chans, survey %dms, focus top-%d x %ds), CAM? on",
              (int)N_CH, SURVEY_MS, FOCUS_TOP_K, FOCUS_SECS);
 }
 
@@ -300,19 +308,17 @@ void app_main(void)
     wifi_sniffer_start();
 
     for (;;) {
-        // ---- STAGE 1: SURVEY ----
         uint32_t score[N_CH];
         for (int i = 0; i < (int)N_CH; i++) {
             score[i] = 0;
             if (!hop_to(CHANS[i].is_5g, CHANS[i].ch)) {
-                continue;   // band/channel refused (region/DFS) -> skip
+                continue;
             }
             vTaskDelay(pdMS_TO_TICKS(SURVEY_MS));
             score[i] = emit_window(SURVEY_MS, false);
         }
         print_status();
 
-        // ---- pick the top-K busiest channels (nonzero only) ----
         int focus_idx[FOCUS_TOP_K];
         int n_focus = 0;
         bool used[N_CH] = { false };
@@ -332,7 +338,6 @@ void app_main(void)
             focus_idx[n_focus++] = best;
         }
 
-        // ---- STAGE 2: FOCUS ----
         for (int f = 0; f < n_focus; f++) {
             if (!hop_to(CHANS[focus_idx[f]].is_5g, CHANS[focus_idx[f]].ch)) {
                 continue;
