@@ -18,3 +18,13 @@ firmware/build/
 firmware/sdkconfig
 firmware/sdkconfig.old
 
+
+# Phase 5 scratch / diagnostics
+*.bak
+diag_*.py
+live_smoke.py
+serial_probe.py
+ble_correlate.py
+ble_survey.py
+survey_*.txt
+_fixture_capture.txt
