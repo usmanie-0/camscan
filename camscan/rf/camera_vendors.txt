@@ -1,0 +1,45 @@
+# camscan camera-vendor keywords (BLE side)
+#
+# One keyword per line. Matching is case-insensitive substring: a keyword
+# matches if it appears anywhere in an advertised BLE name OR in the vendor
+# name that a BLE company-ID resolves to. Blank lines and lines starting with
+# '#' are ignored.
+#
+# The philosophy (from the project handoff): match on vendor NAME/keyword, not
+# a brittle list of raw company-ID numbers. Company IDs get resolved to a
+# vendor name first (see company_ids.txt), then matched here like any name.
+#
+# Keep this list to genuine camera / security-camera makers and their consumer
+# sub-brands. Add freely as you encounter new ones -- editing this file needs
+# no code change and no reflash.
+
+# --- major security-camera makers ---
+hikvision
+ezviz          # Hikvision's consumer smart-home brand
+dahua
+lorex          # Dahua-owned
+amcrest        # Dahua-derived
+tuya           # cloud IoT platform behind many white-label cams
+smart life     # common Tuya app / device name
+reolink
+foscam
+wyze
+ring
+arlo
+nest           # Google Nest cameras
+google nest
+eufy           # Anker's camera brand
+anker
+swann
+uniview
+vivotek
+axis           # Axis Communications (network cameras)
+ubiquiti       # UniFi Protect cameras
+unifi
+tp-link        # Tapo / Kasa cameras
+tapo
+kasa
+xiaomi         # Mi Home cameras
+mi home
+imou           # Dahua consumer brand
+blink          # Amazon Blink

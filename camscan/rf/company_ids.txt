@@ -1,0 +1,32 @@
+# camscan BLE company-ID -> vendor-name table
+#
+# Format: <hex4>,<vendor name>
+#   hex4       4 hex digits, no 0x, matching the firmware's L-line mfr field
+#              (e.g. 004C). Case-insensitive.
+#   vendor name  the human vendor name; this is what gets keyword-matched
+#              against camera_vendors.txt.
+#
+# Blank lines and '#' comments ignored.
+#
+# This is intentionally a SMALL, curated table, not the full Bluetooth SIG
+# list. It exists so a numeric company ID can be resolved to a name and then
+# matched by keyword. Seed it with (a) the IDs you actually observe in your
+# captures, and (b) any known camera-vendor IDs you confirm from the official
+# SIG assigned-numbers list. Unknown IDs simply don't resolve -> no BLE vendor
+# signal for that advert (which is fine; absence proves nothing).
+#
+# To resolve a new ID you see in the wild: look it up in the official list at
+#   https://www.bluetooth.com/specifications/assigned-numbers/
+# and add a line here. Do NOT guess -- an unknown ID left out is correct;
+# a wrong guess is worse than a blank.
+
+# --- observed in captures (NOT cameras; here so they resolve to a name) ---
+004C,Apple, Inc.
+0006,Microsoft
+027D,HUAWEI Technologies Co., Ltd.
+
+# 0942 -- observed on advertiser 40:27:27:D7:0C:BE during lab testing.
+# High/recent SIG assignment, beyond older mirrored lists; vendor not yet
+# confirmed against the official SIG list. Left UNRESOLVED on purpose until
+# confirmed -- add the real vendor name here once verified. Do not guess.
+# 0942,<confirm vendor from official SIG list before filling this in>

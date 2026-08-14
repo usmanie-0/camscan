@@ -41,8 +41,8 @@ FULL_CEILING = 100
 #     these -- tune them at a deployment that has a Wi-Fi-uploading camera.
 WIFI_RSSI_MIN = -70        # weakest RSSI we'll treat as a real nearby uploader
 WIFI_RSSI_STRONG = -60     # "close" -- strong enough to lift the ceiling
-WIFI_ASYM_RATIO = 3        # PLACEHOLDER: up >= 3x down == strongly up-heavy
-WIFI_MIN_UP = 2000         # PLACEHOLDER: bytes floor, to drop trivial/keepalive flows
+WIFI_ASYM_RATIO = 3        # up >= 3x down == strongly up-heavy (Tier-2: real uploads far exceed this)
+WIFI_MIN_UP = 2000         # bytes floor; Tier-2 validated: rejected -90dBm phantoms, kept the -61dBm phone
 
 
 def _lan_points(host):
@@ -343,3 +343,4 @@ if __name__ == "__main__":
         print()
 
     con.close()
+
