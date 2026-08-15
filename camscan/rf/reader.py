@@ -112,21 +112,59 @@ def _iter_serial_lines(
     port: str,
     baud: int,
     timeout: float,
+    send_first: Optional[str] = None,
 ) -> Iterator[str]:
     """Yield decoded text lines from a live serial port, forever.
 
     Imported lazily so the whole module -- and all file-based testing -- works
     even in an environment where pyserial isn't installed. Only this function
     needs it.
+
+    ``send_first``: if given, this text is written to the board ONCE, right
+    after the port is open and settled, before the read loop begins. It's how
+    ``camscan hunt`` hands the firmware a ``HUNT,<mac>,<ch>`` target over the
+    SAME held-open handle -- honouring the one-process-holds-COM5 rule, since
+    the write and the read share this single open port. A trailing newline is
+    added if absent (the firmware reads whole lines with fgets).
     """
     import serial  # pyserial; lazy so file replay never requires it
 
-    # Open WITHOUT resetting the board. On this devkit the CH343's DTR/RTS are
-    # wired to EN/IO0, so a normal open pulses them and reboots the ESP32 --
-    # which meant short-lived opens kept catching only a boot's tail and then
-    # sat through the next boot's silence. The cure (proven by measurement):
-    # disable hardware/DTR flow control, force both lines low so the open pulse
-    # doesn't trigger a reset, then hold the port open for the whole session.
+    ser = _open_board(port, baud, timeout)
+
+    # Hand the board its command (e.g. a HUNT target) on this same open handle,
+    # BEFORE the read loop, so we don't need a second process/opener. We flush
+    # the OUTPUT buffer but deliberately do NOT reset the INPUT buffer again --
+    # that would discard the board's first replies to the command.
+    if send_first is not None:
+        line = send_first if send_first.endswith("\n") else send_first + "\n"
+        ser.write(line.encode("ascii", errors="replace"))
+        ser.flush()
+
+    # Read raw lines directly (the approach that streams steadily here). No
+    # TextIOWrapper: its block buffering stalled under the flood.
+    try:
+        while True:
+            raw = ser.readline()          # bytes, up to and including b"\n"
+            if not raw:
+                continue                   # timeout tick, nothing waiting
+            yield raw.decode("utf-8", errors="replace")
+    finally:
+        ser.close()
+
+
+def _open_board(port: str, baud: int, timeout: float):
+    """Open the C5 without resetting it, returning the held serial handle.
+
+    One source of truth for the CH343 open-discipline. On this devkit the
+    CH343's DTR/RTS are wired to EN/IO0, so a normal open pulses them and
+    reboots the ESP32 -- short-lived opens kept catching only a boot's tail and
+    then sat through the next boot's silence. The cure (proven by measurement):
+    disable hardware/DTR flow control, force both lines low so the open pulse
+    doesn't trigger a reset, then hold the port open for the whole session.
+    Caller owns the returned handle and must close it.
+    """
+    import serial  # pyserial; lazy so file replay never requires it
+
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = baud
@@ -151,17 +189,9 @@ def _iter_serial_lines(
         pass
 
     ser.reset_input_buffer()
+    return ser
 
-    # Read raw lines directly (the approach that streams steadily here). No
-    # TextIOWrapper: its block buffering stalled under the flood.
-    try:
-        while True:
-            raw = ser.readline()          # bytes, up to and including b"\n"
-            if not raw:
-                continue                   # timeout tick, nothing waiting
-            yield raw.decode("utf-8", errors="replace")
-    finally:
-        ser.close()
+
 
 
 def read_from_serial(
@@ -179,3 +209,102 @@ def read_from_serial(
     """
     resolved = resolve_port(port)
     yield from read_records(_iter_serial_lines(resolved, baud, timeout))
+
+
+def hunt_on_serial(
+    mac: str,
+    channel: int,
+    port: Optional[str] = None,
+    baud: int = DEFAULT_BAUD,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Iterator[object]:
+    """Send the firmware a hunt target, then stream records from the same port.
+
+    Opens the board once (reusing the CH343 open-discipline), writes a single
+    ``HUNT,<mac>,<ch>`` command so the firmware parks on ``channel`` and meters
+    ``mac``, then yields the record stream (H lines and the occasional S) over
+    that same held-open handle. One process, one open port -- the write and the
+    read never contend, so the one-process-holds-COM5 rule is respected.
+
+    ``mac`` is normalised to lower-case colon form; the firmware parser accepts
+    any case but we keep the wire format tidy. ``channel`` is 1..165; the
+    firmware infers band (<=14 => 2G, else 5G).
+    """
+    resolved = resolve_port(port)
+    command = f"HUNT,{mac.lower()},{int(channel)}"
+    yield from read_records(
+        _iter_serial_lines(resolved, baud, timeout, send_first=command)
+    )
+
+
+class HuntSession:
+    """One held-open serial session for multi-command orchestration.
+
+    ``camscan hunt --all`` needs to drive the board through several phases over
+    ONE open port: send ``SCAN``, collect D-lines for a while, then send
+    ``HUNT,<mac>,<ch>`` for each candidate in turn. Reopening between phases
+    would reset nothing (CH343 discipline) but would repeatedly contend for the
+    single COM handle; holding one session avoids that and matches the
+    one-process-holds-COM5 rule. Use as a context manager::
+
+        with HuntSession() as s:
+            s.send("SCAN")
+            for rec in s.records(seconds=15): ...
+            s.send("HUNT,<mac>,<ch>")
+            for rec in s.records(): ...   # unbounded until break/KeyboardInterrupt
+
+    The parsing is identical to the generator path -- same parse_line, same
+    skip-None behaviour -- so records are the familiar dataclasses.
+    """
+
+    def __init__(self, port: Optional[str] = None,
+                 baud: int = DEFAULT_BAUD, timeout: float = DEFAULT_TIMEOUT):
+        self._port = resolve_port(port)
+        self._baud = baud
+        self._timeout = timeout
+        self._ser = None
+
+    def __enter__(self):
+        self._ser = _open_board(self._port, self._baud, self._timeout)
+        return self
+
+    def __exit__(self, *exc):
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            finally:
+                self._ser = None
+        return False
+
+    def send(self, command: str) -> None:
+        """Write one command line to the board (newline added if absent)."""
+        line = command if command.endswith("\n") else command + "\n"
+        self._ser.write(line.encode("ascii", errors="replace"))
+        self._ser.flush()
+
+    def _lines(self):
+        while True:
+            raw = self._ser.readline()
+            if not raw:
+                yield None            # timeout tick -- lets bounded reads exit
+                continue
+            yield raw.decode("utf-8", errors="replace")
+
+    def records(self, seconds: Optional[float] = None):
+        """Yield parsed records, optionally stopping after ``seconds``.
+
+        ``seconds=None`` streams until the caller breaks out (or Ctrl-C). A
+        finite value bounds the phase -- used to collect a survey window before
+        moving on. Timeout ticks (empty reads) advance the clock but yield
+        nothing, so a quiet board still lets a bounded read finish on schedule.
+        """
+        import time
+        deadline = None if seconds is None else time.monotonic() + seconds
+        for line in self._lines():
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            if line is None:
+                continue              # timeout tick; clock already advanced
+            rec = parse_line(line)
+            if rec is not None:
+                yield rec

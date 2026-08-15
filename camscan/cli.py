@@ -1,4 +1,4 @@
-﻿"""camscan command-line interface."""
+"""camscan command-line interface."""
 
 import argparse
 import json
@@ -136,6 +136,53 @@ def cmd_db(args):
     con.close()
 
 
+def _valid_mac(s):
+    """argparse type: accept aa:bb:cc:dd:ee:ff (any case), return lower-case."""
+    parts = s.split(":")
+    if len(parts) != 6 or any(len(p) != 2 for p in parts):
+        raise argparse.ArgumentTypeError(
+            f"'{s}' is not a MAC like 46:06:cc:e1:15:b0")
+    try:
+        for p in parts:
+            int(p, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"'{s}' has non-hex digits; expected a MAC like 46:06:cc:e1:15:b0")
+    return s.lower()
+
+
+def cmd_hunt(args):
+    """Live RSSI meter to physically locate devices -- walk the room.
+
+    `camscan hunt <mac> --channel N` meters one device. `camscan hunt --all`
+    surveys first (RF-only, via the firmware SCAN command), then walks each
+    camera-shaped candidate one at a time with its channel found automatically.
+
+    Single-target needs --channel: the board boots parked in hunt mode and the
+    DB stores no channel, so it can't be auto-discovered for one MAC. --all
+    surveys, so it discovers channels itself.
+    """
+    from camscan.rf.hunt import hunt_target, hunt_all
+
+    try:
+        if args.all:
+            hunt_all(port=args.port)
+        else:
+            if not args.mac:
+                print("hunt: give a MAC (with --channel N) or use --all",
+                      file=sys.stderr)
+                return 2
+            if args.channel is None:
+                print("hunt: --channel is required when hunting one MAC "
+                      "(use --all to auto-discover channels)", file=sys.stderr)
+                return 2
+            hunt_target(args.mac, args.channel, port=args.port)
+    except RuntimeError as e:
+        print(f"hunt: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="camscan", description="Hidden networked camera detection")
@@ -154,6 +201,19 @@ def main(argv=None):
 
     d = sub.add_parser("db", help="store statistics")
     d.set_defaults(func=cmd_db)
+
+    hu = sub.add_parser(
+        "hunt",
+        help="live RSSI meter to physically locate devices (walk the room)")
+    hu.add_argument("mac", type=_valid_mac, nargs="?",
+                    help="target MAC, e.g. 46:06:cc:e1:15:b0 (omit with --all)")
+    hu.add_argument("--channel", type=int, default=None,
+                    help="channel the target is on (1-165); required with a MAC")
+    hu.add_argument("--all", action="store_true",
+                    help="survey, then walk every camera-shaped candidate in turn")
+    hu.add_argument("--port", default=None,
+                    help="serial port (auto-detect the C5's CH343 if omitted)")
+    hu.set_defaults(func=cmd_hunt)
 
     args = ap.parse_args(argv)
     args.func(args)

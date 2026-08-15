@@ -1,6 +1,6 @@
 """Parse the CSV lines the ESP32-C5 firmware emits over USB serial.
 
-The firmware speaks five line types, each a comma-separated record with a
+The firmware speaks six line types, each a comma-separated record with a
 single-letter (or ``CAM?``) prefix. This module turns ONE raw line into ONE
 small structured record, or ``None`` if the line isn't a recognized record.
 
@@ -15,6 +15,7 @@ Line formats (pinned from firmware source, not guessed):
     S,<uptime_ms>,<free_heap>,<frames_dropped>
     L,<bdaddr>,<rssi>,<name>,<mfr_id>
     CAM?,<mac>,<band>,<ch>,<rssi_avg>,<bytes_up>,<bytes_down>,<h2>,<h3>,<frames>
+    H,<mac>,<ch>,<rssi>,<frames>,<age_ms>
 
 Design notes:
   * ``band`` is the literal string "2G" or "5G", never a number.
@@ -23,6 +24,9 @@ Design notes:
     We represent absent as ``None``, present-but-empty is impossible here.
   * mfr_id arrives as 4 bare hex digits (e.g. "004C") with NO "0x" prefix.
     We keep the raw hex string AND provide the parsed int for convenience.
+  * An ``H`` line (Phase 6 hunt mode) is a live RSSI meter sample for one
+    target MAC. It has no ``band`` field (hunt parks on a known channel), and
+    ``frames == 0`` marks a silent window where ``rssi`` is not meaningful.
   * A line that doesn't match a known shape returns ``None`` rather than
     raising -- serial streams contain boot log noise, partial lines, and the
     occasional corrupted record, and the read loop shouldn't crash on those.
@@ -109,6 +113,23 @@ class CamHintLine:
     frames: int
 
 
+@dataclass
+class HuntLine:
+    """An ``H`` line: live RSSI meter sample for ONE target MAC (Phase 6).
+
+    Emitted every ~200 ms by the firmware's hunt mode while parked on the
+    target's channel. ``frames == 0`` means the target was silent this window
+    (its ``rssi`` is meaningless then); ``age_ms`` is how long since it was
+    last actually heard, so the meter can hold through short gaps and decay
+    when the target is genuinely lost.
+    """
+    mac: str
+    channel: int
+    rssi: int          # signed dBm; only meaningful when frames > 0
+    frames: int        # target frames heard this window; 0 = silent
+    age_ms: int        # ms since the target was last heard
+
+
 # --- Parser -----------------------------------------------------------------
 
 
@@ -182,6 +203,20 @@ def parse_line(line: str) -> Optional[object]:
                 uptime_ms=int(f[0]),
                 free_heap=int(f[1]),
                 frames_dropped=int(f[2]),
+            )
+
+        if prefix == "H":
+            # Hunt-mode RSSI meter sample. Five fields, no band (parked on a
+            # known channel). frames==0 marks a silent window.
+            f = rest.split(",")
+            if len(f) != 5:
+                return None
+            return HuntLine(
+                mac=f[0],
+                channel=int(f[1]),
+                rssi=int(f[2]),
+                frames=int(f[3]),
+                age_ms=int(f[4]),
             )
 
         if prefix == "L":
